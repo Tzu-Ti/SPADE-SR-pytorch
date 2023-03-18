@@ -43,7 +43,7 @@ class ResBlock_down(nn.Module):
         self.BN1 = nn.BatchNorm2d(in_ch)
         self.relu = nn.ReLU()
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
-        self.BN2 = nn.BatchNorm2d(in_ch)
+        self.BN2 = nn.BatchNorm2d(out_ch)
         self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
         self.avgpool = nn.AvgPool2d(scale)
         
@@ -59,7 +59,7 @@ class ResBlock_down(nn.Module):
         x = self.relu(x) if self.in_ch == 3 else x
         x = self.conv1(x)
         
-        x = self.BN1(x) if self.use_bn else x
+        x = self.BN2(x) if self.use_bn else x
         x = self.relu(x)
         x = self.conv2(x)
         

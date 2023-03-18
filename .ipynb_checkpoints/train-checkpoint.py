@@ -7,13 +7,16 @@ from multiprocessing import cpu_count
 
 import torch
 from torch.utils.data import DataLoader
+from torch.nn import DataParallel
 import torch.optim as optim
 
 from models.generator import Generator
 from models.discriminator import Discriminator
+
 from criterion import D_Criterion_adv, Criterion_h_rec, R1_Penalty
 from criterion import G_Criterion_adv
 from utils import Visdom
+from utils import FID
 
 from torch_ema import ExponentialMovingAverage
 from copy import deepcopy
@@ -25,9 +28,9 @@ def parse():
     parser = argparse.ArgumentParser()
     # training setting
     parser.add_argument('--model_name', default='test')
-    parser.add_argument('--epochs', type=int, default=500)
+    parser.add_argument('--epochs', type=int, default=60)
     parser.add_argument('--warup_epoch', type=int, default=10)
-    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--g_lr', type=float, default=5e-5)
     parser.add_argument('--d_lr', type=float, default=2e-4)
     # training strategy
@@ -41,6 +44,10 @@ def parse():
     parser.add_argument('--h_size_w', type=int, default=8)
     parser.add_argument('--rgb_size_h', type=int, default=40)
     parser.add_argument('--rgb_size_w', type=int, default=64)
+    # I/O setting
+    parser.add_argument('--rgb_npy', default="../lrt-human/rgb.npy")
+    parser.add_argument('--thermal_npy', default="../lrt-human/thermal.npy")
+    parser.add_argument('--saving_folder', default='ckpts')
     # 
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--gpus', type=int, default=4)
@@ -54,7 +61,7 @@ def parse():
     parser.add_argument('--port', type=int, default=1203)
     parser.add_argument('--env', default="test")
     parser.add_argument('--visual_loss_step', type=int, default=10)
-    parser.add_argument('--visual_output_step', type=int, default=100)
+    parser.add_argument('--visual_output_step', type=int, default=50)
     # Mode
     parser.add_argument('--train', action="store_true")
     parser.add_argument('--test', action="store_true")
@@ -68,22 +75,23 @@ class Model_factory():
         self.vis = vis
         self.device = args.device
         
-        trainDataset = TherDataset(rgb_npy_path="../lrt-human/rgb.npy", thermal_npy_path="../lrt-human/thermal.npy")
+        trainDataset = TherDataset(rgb_npy_path=args.rgb_npy, thermal_npy_path=args.thermal_npy)
         self.trainDataloader = DataLoader(dataset=trainDataset,
                                           batch_size=args.batch_size,
                                           shuffle=True, 
                                           num_workers=cpu_count())
         
         self.G = Generator(h_size_h=args.h_size_h, h_size_w=args.h_size_w,
-                           z_dim=args.z_dim, ther_conv_dim=args.g_ther_conv_dim, conv_dim=args.g_conv_dim).to(self.device)
+                           z_dim=args.z_dim, ther_conv_dim=args.g_ther_conv_dim, conv_dim=args.g_conv_dim)
         self.D = Discriminator(h_size_h=args.h_size_h, h_size_w=args.h_size_w,
-                               ther_conv_dim=args.d_ther_conv_dim, conv_dim=args.d_conv_dim).to(self.device)
+                               ther_conv_dim=args.d_ther_conv_dim, conv_dim=args.d_conv_dim)
+        
+        self.G = DataParallel(self.G, device_ids=[i for i in range(self.args.gpus)]).to(self.device)
+        self.D = DataParallel(self.D, device_ids=[i for i in range(self.args.gpus)]).to(self.device)
         
         self.G_ema = ExponentialMovingAverage(self.G.parameters(), decay=0.995)
         self.D_ema = ExponentialMovingAverage(self.D.parameters(), decay=0.995)
-        self.G_ema_model = deepcopy(self.G)
-        self.D_ema_model = deepcopy(self.D)
-        
+
         self.G_optimizer = optim.AdamW(self.G.parameters(), lr=args.g_lr)
         self.D_optimizer = optim.AdamW(self.D.parameters(), lr=args.d_lr)
         
@@ -94,6 +102,9 @@ class Model_factory():
             
         self.G_adv_criterion = G_Criterion_adv()
         self.G_h_rec_criterion = Criterion_h_rec(mode='hinge', hinge_threshold=0.05)
+        
+        self.FID = FID(feature=2048)
+        self.saving_folder = os.path.join(args.saving_folder, args.model_name)
         
     def train_D(self):
         b, c, h, w = self.rgb.shape
@@ -190,12 +201,26 @@ class Model_factory():
                                                        fake_rgb=fake_imgs, rgb=rgb)
         self.vis.Images(images=vis_thermal, win="Epoch-{}-thermal".format(e), ncol=4, unormalize=True)
         self.vis.Images(images=vis_rgb, win="Epoch-{}-rgb".format(e), ncol=4, unormalize=True)
-            
+        
+    def calc_fid(self):
+        pbar = tqdm(self.trainDataloader)
+        for i, (rgb, thermal) in enumerate(pbar):
+            rgb = rgb.to(self.device)
+            thermal = thermal.to(self.device)
+            b, c, h, w = rgb.shape
+            z = torch.randn([b, self.args.z_dim]).to(self.device)
+            with self.G_ema.average_parameters():
+                fake_imgs = self.G(thermal, z)
+            with self.D_ema.average_parameters():
+                fake_labels, fake_rec_thermal = self.D(fake_imgs)
 
+            self.FID.update(real=rgb, fake=fake_imgs)
+        fid = self.FID.compute()
+        print("FID:", fid)
+            
     def save(self, e):
         print("Saving Model...")
-        saving_folder = 'ckpts'
-        if not os.path.isdir(saving_folder): os.makedirs(saving_folder)
+        if not os.path.isdir(self.saving_folder): os.makedirs(self.saving_folder)
         ckpt = {
             "G_parameter": self.G.state_dict(),
             "D_parameter": self.D.state_dict(),
@@ -205,15 +230,35 @@ class Model_factory():
             "G_ema": self.G_ema.state_dict(),
             "D_ema": self.D_ema.state_dict()
         }
-        torch.save(ckpt, 'ckpts/{}.ckpt'.format(self.args.model_name))
+        torch.save(ckpt, '{}/checkpoint.ckpt'.format(self.saving_folder))
         
+        G_ema_model = deepcopy(self.G)
+        D_ema_model = deepcopy(self.D)
+        self.G_ema.copy_to(G_ema_model.parameters())
+        self.D_ema.copy_to(D_ema_model.parameters())
+        
+        torch.save(G_ema_model, '{}/G.pt'.format(self.saving_folder))
+        torch.save(D_ema_model, '{}/D.pt'.format(self.saving_folder))
+
+    def load(self):
+        print("Loading Model...")
+        ckpt = torch.load('{}/checkpoint.ckpt'.format(self.saving_folder))
+        self.G.load_state_dict(ckpt['G_parameter'])
+        self.D.load_state_dict(ckpt['D_parameter'])
+        self.G_optimizer.load_state_dict(ckpt['G_optimizer'])
+        self.D_optimizer.load_state_dict(ckpt['D_optimizer'])
+        self.G_ema.load_state_dict(ckpt['G_ema'])
+        self.D_ema.load_state_dict(ckpt['D_ema'])
+        
+        epoch = ckpt['epoch']
+        return epoch
         
 def main():
     args = parse()
     vis = Visdom(args.env, args.port)
     Model = Model_factory(args, vis)
     
-    start_epoch = Model.load() if args.resume else 1
+    start_epoch = Model.load()+1 if args.resume else 1
     if args.train:
         for e in range(start_epoch, args.epochs+1):
             print("Epoch: {}".format(e))
@@ -223,6 +268,12 @@ def main():
                 print("Validating...")
                 Model.validate(e)
                 Model.save(e)
+
+    if args.test:
+        Model.load()
+        Model.validate(e='Test')
+        Model.calc_fid()
+        
     
 if __name__ == '__main__':
     main()

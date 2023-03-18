@@ -1,6 +1,7 @@
 import torch
 import torchvision
 from torch.utils.data.dataset import Dataset
+import torchvision.transforms.functional as TF
 
 import numpy as np
 
@@ -15,6 +16,7 @@ class TherDataset(Dataset):
         # normalization
         self.transforms_rgb = torchvision.transforms.Compose([
             torchvision.transforms.ToTensor(),
+            torchvision.transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5),
             torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
         self.transforms_thermal = torchvision.transforms.Compose([
@@ -28,6 +30,9 @@ class TherDataset(Dataset):
         
         rgb = self.transforms_rgb(rgb)
         thermal = self.transforms_thermal(thermal)
+        if torch.rand(1) > 0.5:
+            rgb = TF.hflip(rgb)
+            thermal = TF.hflip(thermal)
         
         return rgb, thermal
         
